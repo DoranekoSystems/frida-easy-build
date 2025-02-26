@@ -1,0 +1,224 @@
+name: frida-easy-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: 'Operating System'
+        required: true
+        default: 'windows'
+        type: choice
+        options:
+          - windows
+          - linux
+      architecture:
+        description: 'Architecture to build'
+        required: true
+        default: 'x86_64'
+        type: choice
+        options:
+          - x86
+          - x86_64
+          - arm64
+      config:
+        description: 'Runtime configuration (Windows only)'
+        required: false
+        default: 'mt'
+        type: choice
+        options:
+          - md
+          - mdd
+          - mt
+          - mtd
+
+jobs:
+  validate-inputs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate architecture for Windows
+        if: inputs.os == 'windows' && inputs.architecture == 'arm64'
+        run: |
+          echo "::error::ARM64 is not supported for Windows builds"
+          exit 1
+      - name: Validation passed
+        run: echo "Input validation passed"
+    outputs:
+      validation-passed: ${{ !(inputs.os == 'windows' && inputs.architecture == 'arm64') }}
+
+  build-frida:
+    needs: validate-inputs
+    if: needs.validate-inputs.outputs.validation-passed == 'true'
+    runs-on: ${{ inputs.os == 'linux' && 'ubuntu-latest' || 'windows-latest' }}
+    container: ${{ inputs.os == 'linux' && inputs.architecture == 'arm64' && 'ghcr.io/frida/x-tools-linux-arm64:latest' || inputs.os == 'linux' && inputs.architecture == 'x86' && 'ghcr.io/frida/x-tools-linux-x86:latest' || inputs.os == 'linux' && 'ghcr.io/frida/x-tools-linux-x86_64:latest' || '' }}
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Install Python (Windows)
+        if: inputs.os == 'windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: ${{ inputs.architecture == 'x86_64' && 'x64' || inputs.architecture }}
+          
+      - name: Install dependencies (Windows)
+        if: inputs.os == 'windows'
+        run: |
+          pip install setuptools toml
+      
+      - name: Check out releng
+        run: |
+          git submodule update --init --depth 1 releng
+          cd releng
+          git submodule update --init --depth 1
+      
+      - name: Set environment variables (Windows)
+        if: inputs.os == 'windows'
+        run: |
+          echo "FRIDA_PREFIX=$env:RUNNER_WORKSPACE\dist" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "FRIDA_VERSION=$(python ${{ github.workspace }}/releng/frida_version.py)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      
+      - name: Set environment variables (Linux)
+        if: inputs.os == 'linux'
+        run: |
+          echo "FRIDA_PREFIX=$RUNNER_WORKSPACE/dist" >> $GITHUB_ENV
+          echo "FRIDA_VERSION=$(python ${{ github.workspace }}/releng/frida_version.py)" >> $GITHUB_ENV
+          if [ "${{ inputs.architecture }}" != "x86_64" ]; then
+            echo "FRIDA_QEMU_SYSROOT=/opt/x-tools/$XTOOLS_HOST/$XTOOLS_HOST/sysroot" >> $GITHUB_ENV
+          fi
+          
+      - name: Grab needed submodules
+        run: python tools/ensure-submodules.py frida-core
+      
+      - name: Install Qt if needed (Windows)
+        if: inputs.os == 'windows' && inputs.architecture == 'x86_64'
+        uses: jurplel/install-qt-action@v3
+        with:
+          version: '6.7.0'
+          setup-python: false
+      
+      - name: Install Qt if needed (Linux)
+        if: inputs.os == 'linux' && inputs.architecture == 'x86_64'
+        uses: jurplel/install-qt-action@v3
+        with:
+          version: '6.7.0'
+          setup-python: false
+      
+      - name: Download toolchain (Windows)
+        if: inputs.os == 'windows'
+        run: |
+          New-Item -ItemType Directory -Path "$env:GITHUB_WORKSPACE\deps" -Force
+          python releng/deps.py sync toolchain windows-${{ inputs.architecture }} "$env:GITHUB_WORKSPACE\deps\toolchain-windows-${{ inputs.architecture }}"
+      
+      - name: Download toolchain (Linux)
+        if: inputs.os == 'linux'
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/deps"
+          python releng/deps.py sync toolchain $XTOOLS_HOST "$GITHUB_WORKSPACE/deps/toolchain-$XTOOLS_HOST"
+      
+      - name: Download SDK (Windows)
+        if: inputs.os == 'windows'
+        run: |
+          python releng/deps.py sync sdk windows-${{ inputs.architecture }}-${{ inputs.config }} "$env:GITHUB_WORKSPACE\deps\sdk-windows-${{ inputs.architecture }}-${{ inputs.config }}"
+      
+      - name: Download SDK (Linux)
+        if: inputs.os == 'linux'
+        run: |
+          python releng/deps.py sync sdk $XTOOLS_HOST "$GITHUB_WORKSPACE/deps/sdk-$XTOOLS_HOST"
+      
+      - name: Configure (Windows)
+        if: inputs.os == 'windows'
+        run: >-
+          .\configure
+          --prefix=$Env:FRIDA_PREFIX
+          --host=windows-${{ inputs.architecture }}-${{ inputs.config }}
+          --enable-gadget
+          --enable-server
+          --enable-portal
+          --enable-inject
+          --
+          "-Dfrida_qml=auto"
+          "-Dfrida-gum:devkits=gum,gumjs"
+          "-Dfrida-core:devkits=core"
+      
+      - name: Configure (Linux)
+        if: inputs.os == 'linux'
+        run: >-
+          ./configure
+          --prefix=$FRIDA_PREFIX
+          --host=$XTOOLS_HOST
+          --enable-gadget
+          --enable-server
+          --enable-portal
+          --enable-inject
+          --
+          -Dlibdir=lib
+          -Dfrida_qml=${{ inputs.architecture == 'x86_64' && 'enabled' || 'disabled' }}
+          -Dfrida-gum:devkits=gum,gumjs
+          -Dfrida-core:devkits=core
+      
+      - name: Compile (Windows)
+        if: inputs.os == 'windows'
+        run: .\make
+      
+      - name: Compile (Linux)
+        if: inputs.os == 'linux'
+        run: make
+      
+      - name: Install (Windows)
+        if: inputs.os == 'windows'
+        run: .\make install
+      
+      - name: Install (Linux)
+        if: inputs.os == 'linux'
+        run: make install
+      
+      - name: List detailed build products (Windows)
+        if: inputs.os == 'windows'
+        run: |
+          echo "Build completed successfully!"
+          echo "--------------------------------------"
+          echo "Build products are available at: $Env:FRIDA_PREFIX"
+          echo ""
+          echo "frida-server: $Env:FRIDA_PREFIX\bin\frida-server.exe"
+          echo "frida-portal: $Env:FRIDA_PREFIX\bin\frida-portal.exe"
+          echo "frida-inject: $Env:FRIDA_PREFIX\bin\frida-inject.exe"
+          if ('${{ inputs.architecture }}' -eq 'x86') {
+            echo "frida-gadget: $Env:FRIDA_PREFIX\lib\frida\32\frida-gadget.dll"
+          } else {
+            echo "frida-gadget: $Env:FRIDA_PREFIX\lib\frida\64\frida-gadget.dll"
+          }
+          echo ""
+          echo "Devkits:"
+          echo "- Gum: $Env:FRIDA_PREFIX\lib\frida\devkits\gum\"
+          echo "- GumJS: $Env:FRIDA_PREFIX\lib\frida\devkits\gumjs\"
+          echo "- Core: $Env:FRIDA_PREFIX\lib\frida\devkits\core\"
+      
+      - name: List detailed build products (Linux)
+        if: inputs.os == 'linux'
+        run: |
+          echo "Build completed successfully!"
+          echo "--------------------------------------"
+          echo "Build products are available at: $FRIDA_PREFIX"
+          echo ""
+          echo "frida-server: $FRIDA_PREFIX/bin/frida-server"
+          echo "frida-portal: $FRIDA_PREFIX/bin/frida-portal"
+          echo "frida-inject: $FRIDA_PREFIX/bin/frida-inject"
+          if [[ "${{ inputs.architecture }}" != *"64"* ]]; then
+            echo "frida-gadget: $FRIDA_PREFIX/lib/frida/32/frida-gadget.so"
+          else
+            echo "frida-gadget: $FRIDA_PREFIX/lib/frida/64/frida-gadget.so"
+          fi
+          echo ""
+          echo "Devkits:"
+          echo "- Gum: $FRIDA_PREFIX/lib/frida/devkits/gum/"
+          echo "- GumJS: $FRIDA_PREFIX/lib/frida/devkits/gumjs/"
+          echo "- Core: $FRIDA_PREFIX/lib/frida/devkits/core/"
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: frida-${{ inputs.os }}-${{ inputs.architecture }}${{ inputs.os == 'windows' && format('-{0}', inputs.config) || '' }}
+          path: ${{ env.FRIDA_PREFIX }}
